@@ -25,7 +25,6 @@ available from Mendeley Data:
 - Annotation format: YOLO
 - Predefined split: 80% training, 10% validation, and 10% testing
 
-<> Markdown
 The predefined dataset split consists of:
 
 | Split | Images | Use in this study |
