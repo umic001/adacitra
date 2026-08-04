@@ -216,3 +216,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ADaCITra local data and generated files
+dataset/
+datasets/
+logs/
+output/
+outputs/
+runs/
+
+# Trained model files
+models/
+weights/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Python cache
+__pycache__/
+*.pyc
