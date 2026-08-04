@@ -3,10 +3,9 @@
 ADaCITra is a desktop application for post-training evaluation and
 real-time performance assessment of YOLO object-detection models.
 
-The application supports image, video, and camera inference, IoU-based
-ground-truth matching, synchronized visualization, confusion-matrix
-generation, AP/mAP reporting, instance-level CSV export, and
-cross-platform latency and throughput measurement.
+ADaCITra supports image-mode post-training evaluation through IoU-based ground-truth matching, synchronized visualization, 
+confusion-matrix generation, AP/mAP reporting, and traceable instance-level prediction records in CSV format. 
+It also supports video and camera inference with real-time FPS visualization, together with cross-platform latency and throughput measurement.
 
 ## Case Study
 
