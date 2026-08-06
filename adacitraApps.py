@@ -11,6 +11,7 @@ from ultralytics import YOLO
 import threading
 import time
 import platform
+import sys
 
 # ================= CONFIG =================
 from utils.logger import logger
@@ -39,6 +40,8 @@ APP_VERSION = "0.4.2"
 INFERENCE_IMAGE_SIZE = 640
 CONFIDENCE_THRESHOLD = 0.25
 IOU_THRESHOLD = 0.50
+NMS_IOU_THRESHOLD = 0.70
+MAX_DETECTIONS = 300
 WARMUP_RUNS = 3
 
 # AP/mAP requires predictions below the operating confidence threshold so that
@@ -240,10 +243,73 @@ def synchronize_cuda():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 # ================= UTIL =================
+def get_os_info():
+    """Return detailed OS information for Windows and Linux."""
+    system_name = platform.system()
+
+    if system_name == "Windows":
+        try:
+            import winreg
+
+            registry_path = (
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+            )
+
+            with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                registry_path,
+            ) as registry_key:
+                product_name = winreg.QueryValueEx(
+                    registry_key,
+                    "ProductName",
+                )[0]
+
+                display_version = winreg.QueryValueEx(
+                    registry_key,
+                    "DisplayVersion",
+                )[0]
+
+            build_number = sys.getwindowsversion().build
+
+            # Windows 11 may still be identified as Windows 10
+            # in legacy registry fields.
+            if build_number >= 22000:
+                product_name = product_name.replace(
+                    "Windows 10",
+                    "Windows 11",
+                )
+
+            architecture = platform.machine()
+
+            return (
+                f"{product_name} {display_version}, "
+                f"build {build_number}, {architecture}"
+            )
+
+        except (OSError, FileNotFoundError):
+            build_number = sys.getwindowsversion().build
+            windows_name = (
+                "Windows 11"
+                if build_number >= 22000
+                else "Windows 10"
+            )
+            return (
+                f"{windows_name}, build {build_number}, "
+                f"{platform.machine()}"
+            )
+
+    if system_name == "Linux":
+        return (
+            f"Linux {platform.release()}, "
+            f"{platform.machine()}"
+        )
+
+    return platform.platform()
+
 def log_system_info():
     logger.info("=" * 60)
     logger.info("%s v%s", APP_NAME, APP_VERSION)
-    logger.info("OS      : %s", platform.system())
+    logger.info("OS      : %s", get_os_info())
     logger.info("Python  : %s", platform.python_version())
     logger.info("OpenCV  : %s", cv2.__version__)
     logger.info("PyTorch : %s", torch.__version__)
