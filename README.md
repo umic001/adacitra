@@ -69,6 +69,6 @@ Source code: https://github.com/umic001/adacitra
 ## Installation
 ```bash
 pip install -r requirements.txt
-python adacitraAppsv04.2.py
+python adacitraApps.py
 ```
 ***
