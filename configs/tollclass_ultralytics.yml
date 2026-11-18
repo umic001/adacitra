@@ -1,0 +1,17 @@
+# Dataset root
+path: D:/apps/adacitrav043/dataset
+
+# Required by the Ultralytics dataset parser.
+# These paths are not processed when split="test" is selected.
+train: images/test
+val: images/test
+
+# Test split used for reference validation
+test: images/test
+
+names:
+  0: NonTruck
+  1: 2Axle
+  2: 3Axle
+  3: 4Axle
+  4: 5Axle

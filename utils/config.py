@@ -3,7 +3,7 @@
 # ============================================================
 # Application
 APP_TITLE = "ADaCITra – Axle-based Detection and Classification for Indonesia Toll Road Application"
-APP_VERSION_TAG = "v04.2"
+APP_VERSION_TAG = "v04.3"
 
 # Camera
 USB_CAMERA_WINDOWS = 0

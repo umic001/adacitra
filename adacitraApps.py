@@ -1,4 +1,11 @@
 import os
+# Configure MKL before importing NumPy/PyTorch: Conda's Intel runtime can
+# otherwise collide with PyTorch's OpenMP runtime when plotting validation.
+if os.name == "nt":
+    os.environ["MKL_THREADING_LAYER"] = "SEQUENTIAL"
+# Report plots are saved to files; they must never create Tk windows in a worker.
+os.environ["MPLBACKEND"] = "Agg"
+import queue
 import cv2
 import csv
 import torch
@@ -15,6 +22,8 @@ import sys
 
 # ================= CONFIG =================
 from utils.logger import logger
+from core.ultralytics_evaluator import UltralyticsEvaluator
+from core.inference_timing import run_experiment, summarize, completion_message
 
 from utils.config import (
     APP_TITLE,
@@ -36,207 +45,11 @@ from utils.helpers import (
 # ================= EVALUATION CONFIG =================
 # Keep these values fixed and report them in the paper.
 APP_NAME = "ADaCITra"
-APP_VERSION = "0.4.2"
+APP_VERSION = "0.4.3"
 INFERENCE_IMAGE_SIZE = 640
 CONFIDENCE_THRESHOLD = 0.25
-IOU_THRESHOLD = 0.50
-NMS_IOU_THRESHOLD = 0.70
-MAX_DETECTIONS = 300
 WARMUP_RUNS = 3
-
-# AP/mAP requires predictions below the operating confidence threshold so that
-# a precision-recall curve can be constructed. Confusion-matrix metrics remain
-# evaluated at CONFIDENCE_THRESHOLD.
-AP_MIN_CONFIDENCE = 0.001
-AP_IOU_THRESHOLDS = tuple(round(value, 2) for value in np.arange(0.50, 0.96, 0.05))
-AP_RECALL_POINTS = 101
-
-def calculate_iou_xywhn(box_a, box_b):
-    """Calculate IoU for two normalized [x_center, y_center, width, height] boxes."""
-    if len(box_a) != 4 or len(box_b) != 4:
-        return 0.0
-
-    try:
-        ax, ay, aw, ah = map(float, box_a)
-        bx, by, bw, bh = map(float, box_b)
-    except (TypeError, ValueError):
-        return 0.0
-
-    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
-        return 0.0
-
-    a_x1, a_y1 = ax - aw / 2, ay - ah / 2
-    a_x2, a_y2 = ax + aw / 2, ay + ah / 2
-    b_x1, b_y1 = bx - bw / 2, by - bh / 2
-    b_x2, b_y2 = bx + bw / 2, by + bh / 2
-
-    inter_w = max(0.0, min(a_x2, b_x2) - max(a_x1, b_x1))
-    inter_h = max(0.0, min(a_y2, b_y2) - max(a_y1, b_y1))
-    intersection = inter_w * inter_h
-    union = aw * ah + bw * bh - intersection
-    return intersection / union if union > 0 else 0.0
-
-
-def match_detections(gt_objects, pred_objects, iou_threshold=IOU_THRESHOLD):
-    """
-    Perform class-agnostic one-to-one matching.
-
-    All candidate GT-prediction pairs are sorted by descending IoU. This avoids
-    dependence on the order of objects in the label file while still retaining
-    class-mismatched spatial matches for the extended confusion matrix.
-    """
-    candidates = []
-    for gt_idx, (_, gt_box) in enumerate(gt_objects):
-        for pred_idx, (_, _, pred_box) in enumerate(pred_objects):
-            iou = calculate_iou_xywhn(gt_box, pred_box)
-            if iou >= iou_threshold:
-                candidates.append((iou, gt_idx, pred_idx))
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    used_gt = set()
-    used_pred = set()
-    matches = []
-
-    for iou, gt_idx, pred_idx in candidates:
-        if gt_idx in used_gt or pred_idx in used_pred:
-            continue
-        used_gt.add(gt_idx)
-        used_pred.add(pred_idx)
-        matches.append((gt_idx, pred_idx, iou))
-
-    unmatched_gt = [i for i in range(len(gt_objects)) if i not in used_gt]
-    unmatched_pred = [i for i in range(len(pred_objects)) if i not in used_pred]
-    return matches, unmatched_gt, unmatched_pred
-
-
-def interpolated_ap(recalls, precisions, recall_points=AP_RECALL_POINTS):
-    """Calculate COCO-style interpolated AP over evenly spaced recall points."""
-    if len(recalls) == 0:
-        return 0.0
-
-    sampled_precisions = []
-    for recall_level in np.linspace(0.0, 1.0, recall_points):
-        valid = precisions[recalls >= recall_level]
-        sampled_precisions.append(float(np.max(valid)) if valid.size else 0.0)
-    return float(np.mean(sampled_precisions))
-
-
-def calculate_ap_metrics(
-    gt_by_image,
-    pred_by_image,
-    num_classes,
-    iou_thresholds=AP_IOU_THRESHOLDS,
-):
-    """
-    Calculate per-class AP and mAP using confidence-ranked predictions.
-
-    Matching is performed independently for each class and IoU threshold.
-    Each prediction can match at most one GT object in the same image.
-    Classes without GT objects are excluded from the mAP denominator.
-    """
-    per_class = {}
-
-    for class_id in range(num_classes):
-        gt_boxes_by_image = {}
-        total_gt = 0
-        for image_name, objects in gt_by_image.items():
-            boxes = [
-                box
-                for gt_class, box in objects
-                if int(gt_class) == class_id
-            ]
-            gt_boxes_by_image[image_name] = boxes
-            total_gt += len(boxes)
-
-        predictions = []
-        for image_name, objects in pred_by_image.items():
-            for pred_class, confidence, box in objects:
-                if int(pred_class) == class_id:
-                    predictions.append(
-                        (float(confidence), image_name, box)
-                    )
-        predictions.sort(key=lambda item: item[0], reverse=True)
-
-        ap_by_iou = {}
-        if total_gt == 0:
-            for threshold in iou_thresholds:
-                ap_by_iou[threshold] = float("nan")
-        else:
-            for threshold in iou_thresholds:
-                matched_gt = {
-                    image_name: set()
-                    for image_name in gt_boxes_by_image
-                }
-                true_positive = np.zeros(len(predictions), dtype=float)
-                false_positive = np.zeros(len(predictions), dtype=float)
-
-                for pred_index, (_, image_name, pred_box) in enumerate(predictions):
-                    gt_boxes = gt_boxes_by_image.get(image_name, [])
-                    best_iou = 0.0
-                    best_gt_index = -1
-
-                    for gt_index, gt_box in enumerate(gt_boxes):
-                        if gt_index in matched_gt[image_name]:
-                            continue
-                        iou = calculate_iou_xywhn(gt_box, pred_box)
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_gt_index = gt_index
-
-                    if best_gt_index >= 0 and best_iou >= threshold:
-                        true_positive[pred_index] = 1.0
-                        matched_gt[image_name].add(best_gt_index)
-                    else:
-                        false_positive[pred_index] = 1.0
-
-                cumulative_tp = np.cumsum(true_positive)
-                cumulative_fp = np.cumsum(false_positive)
-                recalls = cumulative_tp / total_gt
-                precisions = np.divide(
-                    cumulative_tp,
-                    cumulative_tp + cumulative_fp,
-                    out=np.zeros_like(cumulative_tp),
-                    where=(cumulative_tp + cumulative_fp) > 0,
-                )
-                ap_by_iou[threshold] = interpolated_ap(
-                    recalls,
-                    precisions,
-                )
-        valid_ap = [
-            value
-            for value in ap_by_iou.values()
-            if not np.isnan(value)
-        ]
-        per_class[class_id] = {
-            "num_gt": total_gt,
-            "num_predictions": len(predictions),
-            "ap50": ap_by_iou.get(0.50, float("nan")),
-            "ap50_95": (
-                float(np.mean(valid_ap))
-                if valid_ap
-                else float("nan")
-            ),
-            "ap_by_iou": ap_by_iou,
-        }
-    valid_ap50 = [
-        values["ap50"]
-        for values in per_class.values()
-        if not np.isnan(values["ap50"])
-    ]
-    valid_ap50_95 = [
-        values["ap50_95"]
-        for values in per_class.values()
-        if not np.isnan(values["ap50_95"])
-    ]
-    return {
-        "per_class": per_class,
-        "map50": float(np.mean(valid_ap50)) if valid_ap50 else 0.0,
-        "map50_95": (
-            float(np.mean(valid_ap50_95))
-            if valid_ap50_95
-            else 0.0
-        ),
-    }
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 def synchronize_cuda():
     """Synchronize CUDA before timing when a CUDA device is active."""
@@ -349,6 +162,7 @@ class ADaCITraApp:
         self.root = root
         root.title(APP_TITLE)
         self.class_names = {}
+        self.yaml_path = None
 
         self.model = None
         self.image_dir = None
@@ -359,7 +173,6 @@ class ADaCITraApp:
         self.images = []
         self.idx = 0
         self.pred_results = {}
-        self.ap_pred_results = {}
         self.gt_all = {}
 
         self.video_path = None
@@ -408,6 +221,7 @@ class ADaCITraApp:
                 f"Found: {sorted(self.class_names)}"
             )
 
+        self.yaml_path = os.path.abspath(yaml_path)
         logger.info("===== YAML LOADED =====")
         logger.info(self.class_names)
 
@@ -450,11 +264,16 @@ class ADaCITraApp:
         f2.pack(pady=5)
         # progress bar
         self.progress = ttk.Progressbar(self.root, orient="horizontal",length=500,mode="determinate")
-        # Removed self.progress.pack(pady=5) from here
+        # Removed self.progress.pack(before=self.title_label, pady=5) from here
         self.progress_label = tk.Label(self.root, text="")
         tk.Button(f1,text="USB Camera",width=18,command=self.load_USBcam).pack(side=tk.LEFT, padx=5)
         tk.Button(f2, text="RUN INFERENCE", width=22, bg="green",fg="white", command=self.run_inference).pack(side=tk.LEFT, padx=10)
-        tk.Button(f2, text="GENERATE REPORT", width=22, bg="blue",fg="white", command=self.generate_report).pack(side=tk.LEFT, padx=10)
+        self.report_button = tk.Button(f2, text="GENERATE REPORT", width=22, bg="blue",fg="white", command=self.generate_report)
+        self.report_button.pack(side=tk.LEFT, padx=10)
+        tk.Button(f2, text="RUN LATENCY", width=16,
+                  command=self.run_timing_experiment).pack(side=tk.LEFT, padx=5)
+        self.report_status = tk.Label(self.root, text="")
+        self.report_status.pack()
         tk.Button(f2, text="EXPORT VIDEO", width=22,command=self.export_video).pack(side=tk.LEFT, padx=10)
         self.btn_pause = tk.Button(f2, text="PAUSE VIDEO", width=22, bg="orange", fg="white", command=self.toggle_video)
         self.btn_pause.pack(side=tk.LEFT, padx=10)
@@ -649,17 +468,13 @@ class ADaCITraApp:
             )
             self.stop_video()
             return
-        # Measure Ultralytics preprocessing + inference + post-processing.
-        synchronize_cuda()
-        start_time = time.perf_counter()
+        # Use the same internal inference timing source as RUN LATENCY.
         results = self.model(
             frame,
             imgsz=INFERENCE_IMAGE_SIZE,
             conf=CONFIDENCE_THRESHOLD,
             verbose=False,
         )[0]
-        synchronize_cuda()
-        end_time = time.perf_counter()
 
         preds = []
         for b in results.boxes:
@@ -668,18 +483,22 @@ class ADaCITraApp:
             box = b.xywhn[0].tolist()
             preds.append((cls, conf, box))
         annotated = draw_pred(frame.copy(), preds, self.class_names)
-        inference_time = end_time - start_time
-        if inference_time > 0:
-            self.current_fps = 1 / inference_time
+        inference_ms = results.speed.get("inference")
+        self.current_fps = (
+            1000.0 / inference_ms
+            if inference_ms is not None and np.isfinite(inference_ms) and inference_ms > 0
+            else None
+        )
         # ================= HUD =================
         # background
-        cv2.rectangle(annotated,(10, 10),(240, 70),(40, 40, 40),-1)
+        cv2.rectangle(annotated,(10, 10),(310, 70),(40, 40, 40),-1)
         # border
-        cv2.rectangle(annotated,(10, 10),(240, 70),(255,255,255),1)
+        cv2.rectangle(annotated,(10, 10),(310, 70),(255,255,255),1)
         # title
         cv2.putText(annotated,"VIDEO INFERENCE",(20, 32),cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),1)
         # fps
-        cv2.putText(annotated,f"FPS : {self.current_fps:.2f}",(20, 58),cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),1)
+        fps_text = f"{self.current_fps:.2f}" if self.current_fps is not None else "N/A"
+        cv2.putText(annotated,f"Inference FPS : {fps_text}",(20, 58),cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),1)
 
         # resize to canvas
         annotated = cv2.resize(annotated,(CANVAS_W, CANVAS_H))
@@ -782,6 +601,8 @@ class ADaCITraApp:
         p = filedialog.askopenfilename(filetypes=[("YOLO Model", "*.pt")])
         if p:
             self.model = YOLO(p)
+            self.model.to(DEVICE)
+            logger.info("Inference device: %s", self.model.device)
             self.show_popup("Model Loaded")
 
     def load_images(self):
@@ -813,12 +634,17 @@ class ADaCITraApp:
     def set_output(self):
         self.output_dir = filedialog.askdirectory()
         if self.output_dir:
-            for sub in ["images", "video", "csv", "confusion"]:
+            for sub in ["images", "video", "csv", "evaluation"]:
                 os.makedirs(os.path.join(self.output_dir, sub), exist_ok=True)
             self.show_popup("Output Path Set")
 
     # ---------- CORE ----------
     def run_inference(self):
+        logger.info("RUN INFERENCE clicked | images=%s | image_dir=%s | output=%s",
+                    len(self.images), self.image_dir, self.output_dir)
+        if getattr(self, "_inference_running", False):
+            self.show_popup("Image inference is still running")
+            return
         if not self.images or not self.image_dir:
             messagebox.showerror("Error", "Please load an image folder first.")
             return
@@ -832,20 +658,27 @@ class ADaCITraApp:
             messagebox.showerror("Error", "Please set an output directory first.")
             return
 
-        self.progress.pack(pady=5)
-        self.progress_label.pack()
+        self.progress.pack(before=self.title_label, pady=5)
+        self.progress_label.pack(before=self.title_label)
         self.progress["maximum"] = len(self.images)
         self.progress["value"] = 0
-        threading.Thread(
-            target=self.run_inference_worker,
-            daemon=True
-        ).start()
+        self.progress_label.config(text="Starting image inference; warming up model...")
+        self._inference_running = True
+        try:
+            threading.Thread(
+                target=self.run_inference_worker,
+                daemon=True
+            ).start()
+        except Exception as error:
+            logger.exception("Could not start image inference worker.")
+            self._finish_inference(str(error))
 
     def _update_inference_progress(self, value, total):
         self.progress["value"] = value
         self.progress_label.config(text=f"Processing {value}/{total}")
 
     def _finish_inference(self, error_message=None):
+        self._inference_running = False
         self.progress["value"] = 0
         self.progress_label.config(text="")
         self.progress.pack_forget()
@@ -858,20 +691,20 @@ class ADaCITraApp:
         self.show_popup("Inference Completed")
 
     def run_inference_worker(self):
+        logger.info("Image inference worker started.")
         self.pred_results.clear()
-        self.ap_pred_results.clear()
         self.gt_all.clear()
         total = len(self.images)
         csv_dir = os.path.join(self.output_dir, "csv")
         image_output_dir = os.path.join(self.output_dir, "images")
-        os.makedirs(csv_dir, exist_ok=True)
-        os.makedirs(image_output_dir, exist_ok=True)
 
         prediction_rows = [["image", "class_id", "confidence", "x", "y", "w", "h"]]
-        ap_prediction_rows = [["image", "class_id", "confidence", "x", "y", "w", "h"]]
         measured_times = []
+        timing_rows = [["image", "pipeline_ms", "preprocess_ms", "inference_ms", "postprocess_ms"]]
 
         try:
+            os.makedirs(csv_dir, exist_ok=True)
+            os.makedirs(image_output_dir, exist_ok=True)
             # Warm up the loaded model before collecting timing measurements.
             first_image_path = os.path.join(self.image_dir, self.images[0])
             warmup_image = cv2.imread(first_image_path)
@@ -882,6 +715,7 @@ class ADaCITraApp:
                     warmup_image,
                     imgsz=INFERENCE_IMAGE_SIZE,
                     conf=CONFIDENCE_THRESHOLD,
+                    device=DEVICE,
                     verbose=False,
                 )
             synchronize_cuda()
@@ -900,10 +734,14 @@ class ADaCITraApp:
                     original_img,
                     imgsz=INFERENCE_IMAGE_SIZE,
                     conf=CONFIDENCE_THRESHOLD,
+                    device=DEVICE,
                     verbose=False,
                 )[0]
                 synchronize_cuda()
                 measured_times.append(time.perf_counter() - start_time)
+                timing_rows.append([name, measured_times[-1] * 1000.0,
+                                    result.speed.get("preprocess"), result.speed.get("inference"),
+                                    result.speed.get("postprocess")])
 
                 preds = []
                 for box_result in result.boxes:
@@ -920,30 +758,6 @@ class ADaCITraApp:
                     preds.append((cls, conf, box))
                     prediction_rows.append([name, cls, conf, *box])
                 self.pred_results[name] = preds
-
-                # A separate low-confidence pass is required for AP/mAP.
-                # It is intentionally excluded from the operating-point timing.
-                ap_result = self.model(
-                    original_img,
-                    imgsz=INFERENCE_IMAGE_SIZE,
-                    conf=AP_MIN_CONFIDENCE,
-                    iou=NMS_IOU_THRESHOLD,
-                    max_det=MAX_DETECTIONS,
-                    agnostic_nms=False,
-                    verbose=False,
-                )[0]
-                ap_preds = []
-                for box_result in ap_result.boxes:
-                    cls = int(box_result.cls[0])
-                    confidence = float(box_result.conf[0])
-                    box = box_result.xywhn[0].tolist()
-                    if cls not in self.class_names:
-                        continue
-                    ap_preds.append((cls, confidence, box))
-                    ap_prediction_rows.append(
-                        [name, cls, confidence, *box]
-                    )
-                self.ap_pred_results[name] = ap_preds
 
                 if self.gt_dir:
                     gt_path = os.path.join(
@@ -972,6 +786,10 @@ class ADaCITraApp:
                 self.root.after(0, self._update_inference_progress, i + 1, total)
 
             self.total_inference_time = sum(measured_times)
+            timing_stats = summarize([value * 1000.0 for value in measured_times])
+            with open(os.path.join(csv_dir, "raw_inference_times.csv"), "w",
+                      newline="", encoding="utf-8") as file:
+                csv.writer(file).writerows(timing_rows)
             measured_count = len(measured_times)
             self.fps = (
                 measured_count / self.total_inference_time
@@ -993,14 +811,6 @@ class ADaCITraApp:
                 csv.writer(file).writerows(prediction_rows)
 
             with open(
-                os.path.join(csv_dir, "ap_predictions.csv"),
-                "w",
-                newline="",
-                encoding="utf-8",
-            ) as file:
-                csv.writer(file).writerows(ap_prediction_rows)
-
-            with open(
                 os.path.join(csv_dir, "summary_report.csv"),
                 "w",
                 newline="",
@@ -1012,17 +822,21 @@ class ADaCITraApp:
                 writer.writerow(["Measured Images", measured_count])
                 writer.writerow(["Image Size", INFERENCE_IMAGE_SIZE])
                 writer.writerow(["Confidence Threshold", CONFIDENCE_THRESHOLD])
-                writer.writerow(["AP Minimum Confidence", AP_MIN_CONFIDENCE])
                 writer.writerow(["Warm-up Runs", WARMUP_RUNS])
                 writer.writerow(["Model Pipeline Time (s)", round(self.total_inference_time, 4)])
                 writer.writerow(["FPS", round(self.fps, 2)])
                 writer.writerow(["Latency (ms/image)", round(latency_ms, 2)])
+                writer.writerow(["Pipeline Mean (ms)", timing_stats["mean_ms"]])
+                writer.writerow(["Pipeline Median (ms)", timing_stats["median_ms"]])
+                writer.writerow(["Pipeline P95 (ms, linear)", timing_stats["p95_ms"]])
                 writer.writerow([
                     "Timing Scope",
                     "Ultralytics preprocessing + inference + post-processing; "
-                    "excludes AP pass, disk read, drawing, GUI update, and file write",
+                    "excludes disk read, drawing, GUI update, and file write",
                 ])
 
+            logger.info("Image inference completed | measured=%s | output=%s",
+                        measured_count, self.output_dir)
             self.root.after(0, self._finish_inference)
         except Exception as error:
             logger.exception("Image inference failed.")
@@ -1077,8 +891,8 @@ class ADaCITraApp:
 
         # Show progress bar
         logger.info("Attempting to pack progress bar.")
-        self.progress.pack(pady=5)
-        self.progress_label.pack()
+        self.progress.pack(before=self.title_label, pady=5)
+        self.progress_label.pack(before=self.title_label)
         self.progress["maximum"] = len(self.images)
         self.progress["value"] = 0
         self.root.update_idletasks() # Force update to ensure progress bar is shown immediately
@@ -1243,1082 +1057,130 @@ class ADaCITraApp:
         if os.path.exists(p):
             self.update_canvas(cv2.imread(p))
 
-    def generate_report(self):
-        if not self.output_dir:
-            messagebox.showerror("Error", "Please set an output directory first.")
-            return      
-        if not self.pred_results:
-            messagebox.showinfo("Info", "No inference results found. Please run inference first.")
+    def run_timing_experiment(self):
+        if getattr(self, "_timing_running", False):
             return
-        if not self.gt_all:
-            messagebox.showwarning(
-                "Warning",
-                "No ground truth was loaded. Quantitative evaluation cannot be generated.",
-            )
+        if (getattr(self, "_report_running", False) or self.video_running
+                or self.progress.winfo_ismapped()):
+            messagebox.showwarning("Latency", "Wait for active inference/export/report or stop video first.")
             return
-        
-        # This will call the save_confusion_matrix method which now includes all metrics
+        if not self.model or not self.images or not self.image_dir or not self.output_dir:
+            messagebox.showwarning("Latency", "Load a model, images, and output folder first.")
+            return
+        settings = dict(model_path=self.model.ckpt_path, device=str(self.model.device),
+                        image_dir=self.image_dir, images=tuple(self.images),
+                        output_dir=self.output_dir, imgsz=INFERENCE_IMAGE_SIZE,
+                        conf=CONFIDENCE_THRESHOLD, warmups=WARMUP_RUNS, repeats=10)
+        self._timing_queue = queue.Queue()
+        self._timing_running = True
+        self._timing_buttons = []
+
+        def disable_buttons(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Button):
+                    self._timing_buttons.append((child, child.cget("state")))
+                    child.config(state="disabled")
+                disable_buttons(child)
+
+        disable_buttons(self.root)
+        self.report_status.config(text="Latency test: warming up (10 runs)...")
         try:
-            self.save_confusion_matrix()
-            self.show_popup("Evaluation Report Generated")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to generate report: {e}")
-    
-    # ---------- CONFUSION MATRIX AND METRICS ----------
-    def save_confusion_matrix(self):
-        logger.info("save_confusion_matrix called.")
-        logger.info(f"Output directory: {self.output_dir}")
-        if not self.class_names:
-            raise ValueError("Class names are empty. Load the dataset YAML first.")
+            threading.Thread(target=self._timing_worker,
+                             args=(settings, self._timing_queue), daemon=True).start()
+        except Exception as error:
+            self._timing_queue.put(("error", str(error)))
+        self.root.after(100, self._poll_timing)
 
-        num_classes = len(self.class_names)
-        expected_ids = set(range(num_classes))
-        if set(self.class_names) != expected_ids:
-            raise ValueError(
-                "YAML class IDs must be contiguous and start at 0. "
-                f"Found: {sorted(self.class_names)}"
-            )
+    @staticmethod
+    def _timing_worker(settings, events):
+        try:
+            def progress(run, index, total):
+                events.put(("progress", f"Latency run {run}/10: image {index}/{total}"))
+            output = run_experiment(**settings, progress=progress)
+            events.put(("done", completion_message(output)))
+        except Exception as error:
+            logger.exception("Timing experiment failed.")
+            events.put(("error", str(error)))
 
-        confusion_dir = os.path.join(self.output_dir, "confusion")
-        os.makedirs(confusion_dir, exist_ok=True)
+    def _poll_timing(self):
+        try:
+            while True:
+                kind, value = self._timing_queue.get_nowait()
+                if kind == "progress":
+                    self.report_status.config(text=value)
+                    continue
+                self._timing_running = False
+                for button, state in self._timing_buttons:
+                    button.config(state=state)
+                self.report_status.config(text="Latency completed: 10/10 runs." if kind == "done" else "Latency failed.")
+                if kind == "done":
+                    messagebox.showinfo("Latency Results", value)
+                else:
+                    messagebox.showerror("Latency Error", value)
+                return
+        except queue.Empty:
+            self.root.after(100, self._poll_timing)
 
-        # The final index has different meanings on the two axes:
-        # last row = prediction without GT (FP)
-        # last column = GT without prediction (FN)
-        unmatched_index = num_classes
-        cm = np.zeros((num_classes + 1, num_classes + 1), dtype=np.int64)
-        class_ious = {class_id: [] for class_id in range(num_classes)}
-        details = [[
-            "image",
-            "gt_class_id",
-            "gt_class_name",
-            "pred_class_id",
-            "pred_class_name",
-            "confidence",
-            "iou",
-            "match_status",
-        ]]
+    def _create_evaluator(self):
+        return UltralyticsEvaluator(
+            model_path=getattr(self.model, "ckpt_path", None),
+            yaml_path=self.yaml_path,
+            output_dir=self.output_dir,
+            app_version=APP_VERSION,
+        )
 
-        for name in self.images:
-            gt_objects = self.gt_all.get(name, [])
-            pred_objects = self.pred_results.get(name, [])
-            matches, unmatched_gt, unmatched_pred = match_detections(
-                gt_objects,
-                pred_objects,
-                IOU_THRESHOLD,
-            )
+    def run_ultralytics_evaluation(self):
+        """Compatibility entry point; evaluation lives in core."""
+        metrics = self._create_evaluator().evaluate()
+        self.ultralytics_metrics = metrics
+        return metrics
 
-            for gt_idx, pred_idx, iou in matches:
-                gt_class = int(gt_objects[gt_idx][0])
-                pred_class = int(pred_objects[pred_idx][0])
-                confidence = float(pred_objects[pred_idx][1])
-                cm[gt_class, pred_class] += 1
-                class_ious[gt_class].append(iou)
-                status = "true_positive" if gt_class == pred_class else "misclassified"
-                details.append([
-                    name,
-                    gt_class,
-                    self.class_names[gt_class],
-                    pred_class,
-                    self.class_names[pred_class],
-                    f"{confidence:.6f}",
-                    f"{iou:.6f}",
-                    status,
-                ])
-
-            for gt_idx in unmatched_gt:
-                gt_class = int(gt_objects[gt_idx][0])
-                cm[gt_class, unmatched_index] += 1
-                details.append([
-                    name,
-                    gt_class,
-                    self.class_names[gt_class],
-                    "",
-                    "No Prediction Match",
-                    "",
-                    "0.000000",
-                    "false_negative",
-                ])
-
-            for pred_idx in unmatched_pred:
-                pred_class = int(pred_objects[pred_idx][0])
-                confidence = float(pred_objects[pred_idx][1])
-                cm[unmatched_index, pred_class] += 1
-                details.append([
-                    name,
-                    "",
-                    "No GT Match",
-                    pred_class,
-                    self.class_names[pred_class],
-                    f"{confidence:.6f}",
-                    "0.000000",
-                    "false_positive",
-                ])
-
-        if cm.sum() == 0:
-            self.show_popup("Confusion matrix skipped (no GTs or predictions found)")
-            logger.info("Confusion matrix skipped: no evaluable objects.")
+    def generate_report(self):
+        if getattr(self, "_report_running", False):
             return
-
-        tp_counts = np.diag(cm[:num_classes, :num_classes]).astype(np.int64)
-        fp_counts = cm[:, :num_classes].sum(axis=0) - tp_counts
-        fn_counts = cm[:num_classes, :].sum(axis=1) - tp_counts
-
-        total_tp = int(tp_counts.sum())
-        total_fp = int(fp_counts.sum())
-        total_fn = int(fn_counts.sum())
-        precision = total_tp / (total_tp + total_fp) if total_tp + total_fp else 0.0
-        recall = total_tp / (total_tp + total_fn) if total_tp + total_fn else 0.0
-        f1_score = (
-            2 * precision * recall / (precision + recall)
-            if precision + recall
-            else 0.0
-        )
-
-        matched_region = cm[:num_classes, :num_classes]
-        matched_count = int(matched_region.sum())
-        classification_accuracy = total_tp / matched_count if matched_count else 0.0
-
-        all_matched_ious = [
-            iou
-            for values in class_ious.values()
-            for iou in values
-        ]
-        mean_iou = (
-            float(np.mean(all_matched_ious))
-            if all_matched_ious
-            else 0.0
-        )
-
-        if not self.ap_pred_results:
-            raise ValueError(
-                "AP predictions are unavailable. Run image inference again "
-                "using ADaCITra v0.4.2 before generating the report."
-            )
-        ap_results = calculate_ap_metrics(
-            self.gt_all,
-            self.ap_pred_results,
-            num_classes,
-            AP_IOU_THRESHOLDS,
-        )
-
-        metrics_data = [[
-            "Metric",
-            "Overall",
-            *[
-                f"Class {class_id} ({self.class_names[class_id]})"
-                for class_id in range(num_classes)
-            ],
-        ]]
-        metric_rows = {
-            "Mean IoU (all spatial matches)": [mean_iou],
-            "Precision": [precision],
-            "Recall": [recall],
-            "F1-score": [f1_score],
-            "Classification accuracy (matched detections)": [classification_accuracy],
-            "TP count": [total_tp],
-            "FP count": [total_fp],
-            "FN count": [total_fn],
-        }
-
-        per_class_values = {
-            key: []
-            for key in metric_rows
-        }
-        for class_id in range(num_classes):
-            tp = int(tp_counts[class_id])
-            fp = int(fp_counts[class_id])
-            fn = int(fn_counts[class_id])
-            class_precision = tp / (tp + fp) if tp + fp else 0.0
-            class_recall = tp / (tp + fn) if tp + fn else 0.0
-            class_f1 = (
-                2 * class_precision * class_recall / (class_precision + class_recall)
-                if class_precision + class_recall
-                else 0.0
-            )
-            detected_gt = int(matched_region[class_id, :].sum())
-            class_accuracy = tp / detected_gt if detected_gt else 0.0
-            class_mean_iou = (
-                float(np.mean(class_ious[class_id]))
-                if class_ious[class_id]
-                else 0.0
-            )
-
-            per_class_values["Mean IoU (all spatial matches)"].append(class_mean_iou)
-            per_class_values["Precision"].append(class_precision)
-            per_class_values["Recall"].append(class_recall)
-            per_class_values["F1-score"].append(class_f1)
-            per_class_values[
-                "Classification accuracy (matched detections)"
-            ].append(class_accuracy)
-            per_class_values["TP count"].append(tp)
-            per_class_values["FP count"].append(fp)
-            per_class_values["FN count"].append(fn)
-
-            logger.info(
-                "Class %s: TP=%d FP=%d FN=%d Precision=%.4f Recall=%.4f "
-                "F1=%.4f MatchedAccuracy=%.4f MeanIoU=%.4f",
-                self.class_names[class_id],
-                tp,
-                fp,
-                fn,
-                class_precision,
-                class_recall,
-                class_f1,
-                class_accuracy,
-                class_mean_iou,
-            )
-
-        for metric_name, overall_values in metric_rows.items():
-            overall = overall_values[0]
-            values = per_class_values[metric_name]
-            if "count" in metric_name.lower():
-                metrics_data.append([metric_name, int(overall), *[int(v) for v in values]])
-            else:
-                metrics_data.append([
-                    metric_name,
-                    f"{overall:.4f}",
-                    *[f"{value:.4f}" for value in values],
-                ])
-
-        metrics_data.append([
-            "AP@0.50",
-            f"{ap_results['map50']:.4f}",
-            *[
-                (
-                    f"{ap_results['per_class'][class_id]['ap50']:.4f}"
-                    if not np.isnan(
-                        ap_results["per_class"][class_id]["ap50"]
-                    )
-                    else "N/A"
-                )
-                for class_id in range(num_classes)
-            ],
-        ])
-        metrics_data.append([
-            "AP@0.50:0.95",
-            f"{ap_results['map50_95']:.4f}",
-            *[
-                (
-                    f"{ap_results['per_class'][class_id]['ap50_95']:.4f}"
-                    if not np.isnan(
-                        ap_results["per_class"][class_id]["ap50_95"]
-                    )
-                    else "N/A"
-                )
-                for class_id in range(num_classes)
-            ],
-        ])
-
-        metrics_data.extend([
-            ["Overall P/R/F1 averaging", "micro", *([""] * num_classes)],
-            ["IoU threshold", f"{IOU_THRESHOLD:.2f}", *([""] * num_classes)],
-            [
-                "Confidence threshold",
-                f"{CONFIDENCE_THRESHOLD:.2f}",
-                *([""] * num_classes),
-            ],
-            [
-                "AP minimum confidence",
-                f"{AP_MIN_CONFIDENCE:.3f}",
-                *([""] * num_classes),
-            ],
-            [
-                "AP interpolation",
-                f"{AP_RECALL_POINTS}-point",
-                *([""] * num_classes),
-            ],
-        ])
-
-        with open(
-            os.path.join(confusion_dir, "metrics_report.csv"),
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as file:
-            csv.writer(file).writerows(metrics_data)
-
-        with open(
-            os.path.join(confusion_dir, "evaluation_details.csv"),
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as file:
-            csv.writer(file).writerows(details)
-
-        ap_headers = [
-            "Class ID",
-            "Class Name",
-            "GT Count",
-            "Prediction Count",
-            "AP@0.50",
-            "AP@0.50:0.95",
-            *[
-                f"AP@{threshold:.2f}"
-                for threshold in AP_IOU_THRESHOLDS
-            ],
-        ]
-        ap_rows = [ap_headers]
-        for class_id in range(num_classes):
-            class_result = ap_results["per_class"][class_id]
-            ap_rows.append([
-                class_id,
-                self.class_names[class_id],
-                class_result["num_gt"],
-                class_result["num_predictions"],
-                (
-                    f"{class_result['ap50']:.6f}"
-                    if not np.isnan(class_result["ap50"])
-                    else "N/A"
-                ),
-                (
-                    f"{class_result['ap50_95']:.6f}"
-                    if not np.isnan(class_result["ap50_95"])
-                    else "N/A"
-                ),
-                *[
-                    (
-                        f"{class_result['ap_by_iou'][threshold]:.6f}"
-                        if not np.isnan(
-                            class_result["ap_by_iou"][threshold]
-                        )
-                        else "N/A"
-                    )
-                    for threshold in AP_IOU_THRESHOLDS
-                ],
-            ])
-        ap_rows.append([
-            "Overall",
-            "mAP",
-            "",
-            "",
-            f"{ap_results['map50']:.6f}",
-            f"{ap_results['map50_95']:.6f}",
-            *[
-                (
-                    "{:.6f}".format(
-                        np.mean([
-                            ap_results["per_class"][class_id]["ap_by_iou"][threshold]
-                            for class_id in range(num_classes)
-                            if not np.isnan(
-                                ap_results["per_class"][class_id]["ap_by_iou"][threshold]
-                            )
-                        ])
-                    )
-                    if any(
-                        not np.isnan(
-                            ap_results["per_class"][class_id]["ap_by_iou"][threshold]
-                        )
-                        for class_id in range(num_classes)
-                    )
-                    else "N/A"
-                )
-                for threshold in AP_IOU_THRESHOLDS
-            ],
-        ])
-        with open(
-            os.path.join(confusion_dir, "ap_metrics_report.csv"),
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as file:
-            csv.writer(file).writerows(ap_rows)
-
-        self._save_ap_by_iou_plot(
-            ap_results=ap_results,
-            class_names=self.class_names,
-            iou_thresholds=AP_IOU_THRESHOLDS,
-            output_path=os.path.join(
-                confusion_dir,
-                "ap_by_iou.png",
-            ),
-        )
-
-        row_labels = [
-            self.class_names[class_id]
-            for class_id in range(num_classes)
-        ] + ["No GT Match (FP)"]
-        column_labels = [
-            self.class_names[class_id]
-            for class_id in range(num_classes)
-        ] + ["No Prediction Match (FN)"]
-
-        with open(
-            os.path.join(confusion_dir, "confusion_matrix.csv"),
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as file:
-            writer = csv.writer(file)
-            writer.writerow(["True Label \\ Predicted Label", *column_labels])
-            for label, row in zip(row_labels, cm):
-                writer.writerow([label, *row.tolist()])
-
-        row_sums = cm.sum(axis=1, keepdims=True)
-        normalized_cm = np.divide(
-            cm,
-            row_sums,
-            out=np.zeros_like(cm, dtype=float),
-            where=row_sums != 0,
-        )
-        with open(
-            os.path.join(confusion_dir, "confusion_matrix_normalized.csv"),
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as file:
-            writer = csv.writer(file)
-            writer.writerow(["True Label \\ Predicted Label", *column_labels])
-            for label, row in zip(row_labels, normalized_cm):
-                writer.writerow([label, *[f"{value:.6f}" for value in row]])
-
-        self._save_confusion_plot(
-            cm,
-            row_labels,
-            column_labels,
-            os.path.join(confusion_dir, "confusion_matrix.png"),
-            "Extended Confusion Matrix (Counts)",
-            value_format="d",
-        )
-
-        self._save_confusion_plot(
-            normalized_cm,
-            row_labels,
-            column_labels,
-            os.path.join(confusion_dir, "confusion_matrix_normalized.png"),
-            "Extended Confusion Matrix (Row-normalized)",
-            value_format=".2f",
-        )
-
-        logger.info(
-            "Overall metrics: Precision=%.4f Recall=%.4f F1=%.4f "
-            "MatchedAccuracy=%.4f MeanIoU=%.4f",
-            precision,
-            recall,
-            f1_score,
-            classification_accuracy,
-            mean_iou,
-        )
-        logger.info(
-            "AP metrics: mAP@0.50=%.4f mAP@0.50:0.95=%.4f "
-            "(%d-point interpolation, AP min confidence=%.3f)",
-            ap_results["map50"],
-            ap_results["map50_95"],
-            AP_RECALL_POINTS,
-            AP_MIN_CONFIDENCE,
-        )
-        logger.info("Evaluation report saved to: %s", confusion_dir)
+        # Freeze report inputs so changing a GUI selection cannot mix datasets.
+        evaluation = self._create_evaluator()
+        self._report_queue = queue.Queue()
+        self._report_running = True
+        self.report_button.config(state="disabled")
+        self.report_status.config(text="Evaluating YAML test split; please wait...")
+        try:
+            threading.Thread(target=self._report_worker,
+                             args=(evaluation, self._report_queue), daemon=True).start()
+        except Exception as error:
+            self._report_queue.put((None, str(error)))
+        self.root.after(100, self._poll_report)
 
     @staticmethod
-    def _save_ap_by_iou_plot(
-        ap_results,
-        class_names,
-        iou_thresholds,
-        output_path,
-    ):
-        """
-        Save class-wise AP and overall mAP across IoU thresholds.
+    def _report_worker(evaluation, results):
+        # No Tk calls in this thread, including root.after().
+        try:
+            results.put((evaluation.evaluate(), None))
+        except Exception as error:
+            logger.exception("Ultralytics evaluation failed.")
+            results.put((None, str(error)))
 
-        The graph is generated using Pillow to avoid loading an additional
-        OpenMP runtime through Matplotlib on Windows.
-        """
-        image_width = 1400
-        image_height = 900
-
-        left_margin = 130
-        right_margin = 310
-        top_margin = 110
-        bottom_margin = 130
-
-        plot_left = left_margin
-        plot_top = top_margin
-        plot_right = image_width - right_margin
-        plot_bottom = image_height - bottom_margin
-
-        plot_width = plot_right - plot_left
-        plot_height = plot_bottom - plot_top
-
-        image = Image.new(
-            "RGB",
-            (image_width, image_height),
-            "white",
-        )
-        draw = ImageDraw.Draw(image)
-
-        def load_font(size, bold=False):
-            font_candidates = [
-                "arialbd.ttf" if bold else "arial.ttf",
-                "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
-            ]
-
-            for font_name in font_candidates:
-                try:
-                    return ImageFont.truetype(font_name, size)
-                except OSError:
-                    continue
-
-            return ImageFont.load_default()
-
-        title_font = load_font(34, bold=True)
-        axis_font = load_font(25, bold=True)
-        tick_font = load_font(21)
-        legend_font = load_font(21)
-        legend_title_font = load_font(22, bold=True)
-
-        def text_size(text, font):
-            bbox = draw.textbbox((0, 0), str(text), font=font)
-            return bbox[2] - bbox[0], bbox[3] - bbox[1]
-
-        # ---------------------------------------------------------
-        # Graph title
-        # ---------------------------------------------------------
-        title = "AP across IoU Thresholds"
-
-        title_width, _ = text_size(title, title_font)
-
-        draw.text(
-            ((image_width - title_width) / 2, 35),
-            title,
-            fill="black",
-            font=title_font,
-        )
-
-        # ---------------------------------------------------------
-        # Coordinate conversion
-        # ---------------------------------------------------------
-        thresholds = [float(value) for value in iou_thresholds]
-
-        min_iou = min(thresholds)
-        max_iou = max(thresholds)
-
-        def x_coordinate(iou):
-            if max_iou == min_iou:
-                return plot_left
-
-            ratio = (iou - min_iou) / (max_iou - min_iou)
-            return plot_left + ratio * plot_width
-
-        def y_coordinate(ap_value):
-            value = min(max(float(ap_value), 0.0), 1.0)
-            return plot_bottom - value * plot_height
-
-        # ---------------------------------------------------------
-        # Grid and Y-axis ticks
-        # ---------------------------------------------------------
-        for tick_index in range(11):
-            ap_value = tick_index / 10.0
-            y = y_coordinate(ap_value)
-
-            draw.line(
-                [(plot_left, y), (plot_right, y)],
-                fill=(220, 220, 220),
-                width=1,
+    def _poll_report(self):
+        try:
+            metrics, error = self._report_queue.get_nowait()
+        except queue.Empty:
+            self.root.after(100, self._poll_report)
+            return
+        self._report_running = False
+        self.report_button.config(state="normal")
+        self.report_status.config(text="Evaluation failed." if error else "Evaluation completed.")
+        if error:
+            messagebox.showerror("Evaluation Error", error)
+        else:
+            self.ultralytics_metrics = metrics
+            messagebox.showinfo(
+                "Ultralytics Evaluation",
+                f"Evaluation completed for the YAML test split.\nReports: {metrics.save_dir}",
             )
 
-            label = f"{ap_value:.1f}"
-            label_width, label_height = text_size(label, tick_font)
-
-            draw.text(
-                (
-                    plot_left - label_width - 15,
-                    y - label_height / 2,
-                ),
-                label,
-                fill="black",
-                font=tick_font,
-            )
-
-        # ---------------------------------------------------------
-        # X-axis ticks
-        # ---------------------------------------------------------
-        for threshold in thresholds:
-            x = x_coordinate(threshold)
-
-            draw.line(
-                [(x, plot_top), (x, plot_bottom)],
-                fill=(235, 235, 235),
-                width=1,
-            )
-
-            label = f"{threshold:.2f}"
-            label_width, _ = text_size(label, tick_font)
-
-            draw.text(
-                (
-                    x - label_width / 2,
-                    plot_bottom + 18,
-                ),
-                label,
-                fill="black",
-                font=tick_font,
-            )
-
-        # ---------------------------------------------------------
-        # Main axes
-        # ---------------------------------------------------------
-        draw.line(
-            [(plot_left, plot_top), (plot_left, plot_bottom)],
-            fill="black",
-            width=3,
-        )
-
-        draw.line(
-            [(plot_left, plot_bottom), (plot_right, plot_bottom)],
-            fill="black",
-            width=3,
-        )
-
-        # ---------------------------------------------------------
-        # Axis labels
-        # ---------------------------------------------------------
-        x_axis_label = "IoU Threshold"
-        x_label_width, _ = text_size(x_axis_label, axis_font)
-
-        draw.text(
-            (
-                plot_left + (plot_width - x_label_width) / 2,
-                image_height - 60,
-            ),
-            x_axis_label,
-            fill="black",
-            font=axis_font,
-        )
-
-        y_axis_label = "AP / mAP"
-
-        # Draw the Y label on a temporary image, then rotate it.
-        y_label_bbox = draw.textbbox(
-            (0, 0),
-            y_axis_label,
-            font=axis_font,
-        )
-
-        y_label_width = y_label_bbox[2] - y_label_bbox[0]
-        y_label_height = y_label_bbox[3] - y_label_bbox[1]
-
-        y_label_image = Image.new(
-            "RGBA",
-            (y_label_width + 20, y_label_height + 20),
-            (255, 255, 255, 0),
-        )
-
-        y_label_draw = ImageDraw.Draw(y_label_image)
-
-        y_label_draw.text(
-            (10, 5),
-            y_axis_label,
-            fill="black",
-            font=axis_font,
-        )
-
-        y_label_image = y_label_image.rotate(
-            90,
-            expand=True,
-        )
-
-        image.paste(
-            y_label_image,
-            (
-                20,
-                int(
-                    plot_top
-                    + (plot_height - y_label_image.height) / 2
-                ),
-            ),
-            y_label_image,
-        )
-
-        # ---------------------------------------------------------
-        # Colors for each class
-        # ---------------------------------------------------------
-        colors = [
-            (31, 119, 180),    # blue
-            (255, 127, 14),    # orange
-            (44, 160, 44),     # green
-            (214, 39, 40),     # red
-            (148, 103, 189),   # purple
-            (140, 86, 75),     # brown
-            (227, 119, 194),   # pink
-            (127, 127, 127),   # gray
-        ]
-
-        legend_entries = []
-
-        # ---------------------------------------------------------
-        # Class-wise AP curves
-        # ---------------------------------------------------------
-        per_class = ap_results["per_class"]
-
-        for class_index, class_id in enumerate(sorted(per_class)):
-            class_result = per_class[class_id]
-            color = colors[class_index % len(colors)]
-
-            if isinstance(class_names, dict):
-                class_name = class_names.get(
-                    class_id,
-                    f"Class {class_id}",
-                )
-            else:
-                class_name = (
-                    class_names[class_id]
-                    if class_id < len(class_names)
-                    else f"Class {class_id}"
-                )
-
-            points = []
-
-            for threshold in thresholds:
-                ap_value = class_result["ap_by_iou"].get(
-                    threshold,
-                    float("nan"),
-                )
-
-                if np.isnan(ap_value):
-                    continue
-
-                points.append(
-                    (
-                        x_coordinate(threshold),
-                        y_coordinate(ap_value),
-                    )
-                )
-
-            if len(points) >= 2:
-                draw.line(
-                    points,
-                    fill=color,
-                    width=4,
-                )
-
-            for x, y in points:
-                radius = 6
-
-                draw.ellipse(
-                    [
-                        x - radius,
-                        y - radius,
-                        x + radius,
-                        y + radius,
-                    ],
-                    fill=color,
-                    outline="white",
-                    width=1,
-                )
-
-            legend_entries.append(
-                (str(class_name), color, 4)
-            )
-
-        # ---------------------------------------------------------
-        # Overall mAP curve
-        # ---------------------------------------------------------
-        overall_map_values = []
-
-        for threshold in thresholds:
-            valid_values = []
-
-            for class_id in per_class:
-                ap_value = per_class[class_id]["ap_by_iou"].get(
-                    threshold,
-                    float("nan"),
-                )
-
-                if not np.isnan(ap_value):
-                    valid_values.append(float(ap_value))
-
-            if valid_values:
-                overall_map_values.append(
-                    (
-                        threshold,
-                        float(np.mean(valid_values)),
-                    )
-                )
-
-        overall_points = [
-            (
-                x_coordinate(threshold),
-                y_coordinate(map_value),
-            )
-            for threshold, map_value in overall_map_values
-        ]
-
-        if len(overall_points) >= 2:
-            draw.line(
-                overall_points,
-                fill=(20, 20, 20),
-                width=7,
-            )
-
-        for x, y in overall_points:
-            radius = 8
-
-            draw.ellipse(
-                [
-                    x - radius,
-                    y - radius,
-                    x + radius,
-                    y + radius,
-                ],
-                fill=(20, 20, 20),
-                outline="white",
-                width=2,
-            )
-
-        legend_entries.append(
-            ("Overall mAP", (20, 20, 20), 7)
-        )
-
-        # ---------------------------------------------------------
-        # Legend
-        # ---------------------------------------------------------
-        legend_x = plot_right + 40
-        legend_y = plot_top + 10
-
-        draw.text(
-            (legend_x, legend_y),
-            "Class",
-            fill="black",
-            font=legend_title_font,
-        )
-
-        legend_y += 48
-
-        for label, color, line_width in legend_entries:
-            line_y = legend_y + 10
-
-            draw.line(
-                [
-                    (legend_x, line_y),
-                    (legend_x + 55, line_y),
-                ],
-                fill=color,
-                width=line_width,
-            )
-
-            draw.ellipse(
-                [
-                    legend_x + 23,
-                    line_y - 5,
-                    legend_x + 33,
-                    line_y + 5,
-                ],
-                fill=color,
-            )
-
-            draw.text(
-                (legend_x + 72, legend_y),
-                label,
-                fill="black",
-                font=legend_font,
-            )
-
-            legend_y += 42
-
-        # ---------------------------------------------------------
-        # Explanatory note
-        # ---------------------------------------------------------
-        note = (
-            "Confidence-ranked\n"
-            "predictions are used\n"
-            "for AP calculation."
-        )
-
-        draw.multiline_text(
-            (legend_x, legend_y + 25),
-            note,
-            fill=(80, 80, 80),
-            font=tick_font,
-            spacing=5,
-        )
-
-        # Ensure the parent output directory exists.
-        output_directory = os.path.dirname(output_path)
-
-        if output_directory:
-            os.makedirs(
-                output_directory,
-                exist_ok=True,
-            )
-
-        image.save(
-            output_path,
-            format="PNG",
-        )
-
-        logger.info(
-            "AP-by-IoU graph saved to: %s",
-            output_path,
-        )
-
-    @staticmethod
-    def _save_confusion_plot(
-        matrix,
-        row_labels,
-        column_labels,
-        output_path,
-        title,
-        value_format,
-    ):
-        """
-        Save a confusion-matrix heatmap using Pillow.
-
-        Pillow is intentionally used instead of Matplotlib to avoid loading a
-        second OpenMP runtime alongside CPU PyTorch on Windows.
-        """
-        rows, columns = matrix.shape
-        cell_size = 105
-        left_margin = 230
-        top_margin = 215
-        right_margin = 60
-        bottom_margin = 90
-        image_width = left_margin + columns * cell_size + right_margin
-        image_height = top_margin + rows * cell_size + bottom_margin
-
-        image = Image.new("RGB", (image_width, image_height), "white")
-        draw = ImageDraw.Draw(image)
-
-        def load_font(size, bold=False):
-            font_candidates = [
-                "arialbd.ttf" if bold else "arial.ttf",
-                "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
-            ]
-            for candidate in font_candidates:
-                try:
-                    return ImageFont.truetype(candidate, size=size)
-                except OSError:
-                    continue
-            return ImageFont.load_default()
-
-        title_font = load_font(25, bold=True)
-        axis_font = load_font(19, bold=True)
-        label_font = load_font(16)
-        value_font = load_font(17, bold=True)
-
-        title_box = draw.textbbox((0, 0), title, font=title_font)
-        title_width = title_box[2] - title_box[0]
-        draw.text(
-            ((image_width - title_width) / 2, 20),
-            title,
-            fill="black",
-            font=title_font,
-        )
-
-        predicted_label = "Predicted label"
-        predicted_box = draw.textbbox((0, 0), predicted_label, font=axis_font)
-        predicted_width = predicted_box[2] - predicted_box[0]
-        draw.text(
-            (
-                left_margin + (columns * cell_size - predicted_width) / 2,
-                62,
-            ),
-            predicted_label,
-            fill="black",
-            font=axis_font,
-        )
-
-        true_label = "True label"
-        true_label_image = Image.new("RGBA", (180, 40), (255, 255, 255, 0))
-        true_draw = ImageDraw.Draw(true_label_image)
-        true_draw.text((0, 5), true_label, fill="black", font=axis_font)
-        true_label_image = true_label_image.rotate(90, expand=True)
-        image.paste(
-            true_label_image,
-            (
-                15,
-                top_margin + (rows * cell_size - true_label_image.height) // 2,
-            ),
-            true_label_image,
-        )
-
-        # Draw column labels vertically so long labels remain readable.
-        for column_index, label in enumerate(column_labels):
-            label_box = draw.textbbox((0, 0), label, font=label_font)
-            label_width = max(1, label_box[2] - label_box[0] + 12)
-            label_image = Image.new(
-                "RGBA",
-                (label_width, 30),
-                (255, 255, 255, 0),
-            )
-            label_draw = ImageDraw.Draw(label_image)
-            label_draw.text((6, 4), label, fill="black", font=label_font)
-            label_image = label_image.rotate(90, expand=True)
-            x_position = (
-                left_margin
-                + column_index * cell_size
-                + (cell_size - label_image.width) // 2
-            )
-            y_position = top_margin - label_image.height - 8
-            image.paste(
-                label_image,
-                (x_position, y_position),
-                label_image,
-            )
-
-        maximum = float(np.max(matrix)) if matrix.size else 0.0
-        for row_index in range(rows):
-            row_label = row_labels[row_index]
-            label_box = draw.textbbox((0, 0), row_label, font=label_font)
-            label_width = label_box[2] - label_box[0]
-            label_height = label_box[3] - label_box[1]
-            draw.text(
-                (
-                    left_margin - label_width - 12,
-                    top_margin
-                    + row_index * cell_size
-                    + (cell_size - label_height) / 2,
-                ),
-                row_label,
-                fill="black",
-                font=label_font,
-            )
-
-            for column_index in range(columns):
-                value = float(matrix[row_index, column_index])
-                ratio = value / maximum if maximum > 0 else 0.0
-                # A restrained approximation of the Matplotlib "Blues" map.
-                red = int(247 - 220 * ratio)
-                green = int(251 - 145 * ratio)
-                blue = int(255 - 55 * ratio)
-                fill_color = (
-                    max(0, red),
-                    max(0, green),
-                    max(0, blue),
-                )
-
-                x1 = left_margin + column_index * cell_size
-                y1 = top_margin + row_index * cell_size
-                x2 = x1 + cell_size
-                y2 = y1 + cell_size
-                draw.rectangle(
-                    (x1, y1, x2, y2),
-                    fill=fill_color,
-                    outline=(185, 195, 205),
-                    width=1,
-                )
-
-                value_text = (
-                    str(int(value))
-                    if value_format == "d"
-                    else f"{value:.2f}"
-                )
-                value_box = draw.textbbox(
-                    (0, 0),
-                    value_text,
-                    font=value_font,
-                )
-                value_width = value_box[2] - value_box[0]
-                value_height = value_box[3] - value_box[1]
-                draw.text(
-                    (
-                        x1 + (cell_size - value_width) / 2,
-                        y1 + (cell_size - value_height) / 2,
-                    ),
-                    value_text,
-                    fill="white" if ratio > 0.52 else "black",
-                    font=value_font,
-                )
-
-        image.save(output_path, format="PNG")
+    def save_confusion_matrix(self):
+        """Retain the report entry point; all metrics and CM come from Ultralytics."""
+        return self.run_ultralytics_evaluation()
 
 # ================= RUN =================
 if __name__ == "__main__":
@@ -2326,3 +1188,5 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = ADaCITraApp(root)
     root.mainloop()
+
+
